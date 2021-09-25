@@ -1,47 +1,31 @@
-import pandas as pd
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, ExtraTreesClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.metrics import roc_auc_score
-from sklearn.svm import SVC
 from xgboost import XGBClassifier
-from sklearn.model_selection import ParameterGrid
 from questions_tags_clustering import get_questions_tag_groups
 from transformers import *
 from lightgbm import LGBMClassifier
 import optuna
 from hyperparameters import *
+import numpy as np
 
 
 def predict_classification(pipeline, X_test, y_test):
     y_pred = pipeline.predict(X_test)
-    # scores = {"accuracy": accuracy_score(y_test, y_pred),
-    #           "f1 score": f1_score(y_test, y_pred),
-    #           "precision": precision_score(y_test, y_pred),
-    #           "recall": recall_score(y_test, y_pred),
-    #           "confusion matrix": confusion_matrix(y_test, y_pred)}
-    scores = roc_auc_score(y_test, y_pred)
-    return scores
-
-
-def filter_data(df, percentage=0.00001):
-    users = df['user_id'].unique()
-    print(int(percentage * df.shape[0]))
-    filtered_df = df.set_index('user_id').loc[users[:int(percentage * df.shape[0])]].reset_index()
-    return filtered_df[filtered_df['answered_correctly'] != -1]
+    return roc_auc_score(y_test, y_pred)
 
 
 def cross_validate(pipeline, path='archive/', target='answered_correctly', n_folds=5):
-    scores_val, scores_train = [], []
+    scores_val = []
     for ind in range(1, n_folds + 1):
-        train = filter_data(pd.read_pickle(f'{path}cv{ind}_train.pickle'))
-        val = filter_data(pd.read_pickle(f'{path}cv{ind}_valid.pickle'))
+        train = filter_df_to_questions_only(pd.read_pickle(f'{path}cv{ind}_train.pickle'))
+        val = filter_df_to_questions_only(pd.read_pickle(f'{path}cv{ind}_valid.pickle'))
 
-        pipeline.fit(train, train[target], eval_metric='logloss')
+        pipeline.fit(train, train[target])
         scores_val.append(predict_classification(pipeline, val.drop(target, axis=1), val[target]))
-        scores_train.append(predict_classification(pipeline, train.drop(target, axis=1), train[target]))
 
-    return dict(pd.DataFrame(scores_train).mean()), dict(pd.DataFrame(scores_val).mean())
+    return np.mean(scores_val)
 
 
 def read_questions_df(path='data/'):
@@ -67,43 +51,23 @@ def optuna_search(trial, estimator, param_generator):
     pipeline = Pipeline([('transformers', FeatureUnion(transformer_list)),
                          ('model', model)])
 
-    scores_train, scores_test = cross_validate(pipeline)
-    return scores_test[0]
+    scores_test = cross_validate(pipeline)
+    return scores_test
 
 
 def model_search():
-    ensemble_clf = [XGBClassifier, LGBMClassifier]
+    models = {'xgboost': (XGBClassifier, get_xgboost_params),
+              'lgbm': (LGBMClassifier, get_lgbm_params),
+              'random_forest': (RandomForestClassifier, get_random_forest_params),
+              'logistic_regression': (LogisticRegression, get_logistic_regression_params)}
 
-    for i in range(len(ensemble_clf)):
-        objective = lambda trial: optuna_search(trial, ensemble_clf[i], get_xgboost_params)
+    for model_name, model_conf in models.items():
+        clf, params = model_conf
+        objective = lambda trial: optuna_search(trial, clf, params)
 
         study = optuna.create_study(direction='maximize')
-        study.optimize(objective, n_trials=1)  # 10
-        print(ensemble_clf[i])
-        print(study.best_trial)
-        print(study.best_value)
-
-
-def grid_search():
-    transformer_list = create_transformers()
-
-    param_options = {'n_estimators': [100],
-                     'objective': ['binary'],
-                     'is_unbalance': [True],
-                     }
-    best_score = 0
-    best_option = None
-
-    for option in ParameterGrid(param_options):
-        pipeline = Pipeline([('transformers', FeatureUnion(transformer_list)),
-                             ('model', LGBMClassifier(**option))])
-
-        scores_train, scores_test = cross_validate(pipeline)
-        print("train scores: ", scores_train)
-        print("test scores: ", scores_test)
-        best_score = max(scores_test, best_score)
-        best_option = option if best_score == scores_test else best_option
-    return best_score, best_option
+        study.optimize(objective, n_trials=30)
+        print(f'Best trial for classifier {model_name} is {study.best_trial} with roc-auc score of {study.best_value} ')
 
 
 if __name__ == '__main__':
